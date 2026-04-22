@@ -110,7 +110,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="MuJoCo vs AstribotFK cross-validation on HDF5 trajectory.")
     parser.add_argument("--hdf5", default=DEFAULT_HDF5, help="HDF5 trajectory file.")
     parser.add_argument("--meshes-dir", default=None, help="Mesh directory (s1_* subfolders).")
-    parser.add_argument("--step", type=int, default=5, help="Evaluate every Nth frame.")
+    parser.add_argument("--step", type=int, default=1, help="Evaluate every Nth frame.")
     parser.add_argument("--list-bodies", action="store_true", help="Print all MuJoCo body names and exit.")
     args = parser.parse_args()
 

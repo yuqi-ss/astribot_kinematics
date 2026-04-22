@@ -437,7 +437,7 @@ def evaluate_efficiency(fk: AstribotFK, data: TrajectoryData, n_calls: int) -> N
 def main() -> None:
     parser = argparse.ArgumentParser(description="Comprehensive FK validation on an HDF5 trajectory.")
     parser.add_argument("--hdf5", default=DEFAULT_HDF5, help="Path to trajectory HDF5 file.")
-    parser.add_argument("--step", type=int, default=5, help="Evaluate every Nth frame.")
+    parser.add_argument("--step", type=int, default=1, help="Evaluate every Nth frame.")
     parser.add_argument(
         "--quasi-static-threshold",
         type=float,

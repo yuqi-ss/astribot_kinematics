@@ -46,6 +46,7 @@ ARM_LEFT_SLICE = slice(7, 14)
 ARM_RIGHT_SLICE = slice(15, 22)
 
 ARM_KEYS = (CHAIN_ARM_LEFT, CHAIN_ARM_RIGHT)
+EEF_KEYS = (CHAIN_TORSO, CHAIN_ARM_LEFT, CHAIN_ARM_RIGHT)
 
 
 # ---------------------------------------------------------------------------
@@ -62,10 +63,7 @@ def _load_trajectory(path: str) -> TrajectoryData:
         raise FileNotFoundError(f"HDF5 file not found: {path}")
     with h5py.File(path, "r") as f:
         joints_cmd = f["joints_dict/joints_position_command"][()]
-        gt = {
-            CHAIN_ARM_LEFT: f["command_poses_dict/astribot_arm_left"][()],
-            CHAIN_ARM_RIGHT: f["command_poses_dict/astribot_arm_right"][()],
-        }
+        gt = {key: f[f"command_poses_dict/{key}"][()] for key in EEF_KEYS}
     q_user = np.concatenate(
         [joints_cmd[:, TORSO_SLICE], joints_cmd[:, ARM_LEFT_SLICE], joints_cmd[:, ARM_RIGHT_SLICE]],
         axis=1,
@@ -159,7 +157,8 @@ class IKRunResult:
 
 def replay_trajectory(
     fk: AstribotFK,
-    ik: AstribotIK,
+    ik_torso: AstribotIK,
+    ik_arms: AstribotIK,
     data: TrajectoryData,
     frame_indices: np.ndarray,
     max_iters: int,
@@ -167,9 +166,11 @@ def replay_trajectory(
     tol_rot: float,
     damping: float,
 ) -> IKRunResult:
+    """Two-step solve per frame: first torso, then both arms on top of the torso
+    solution (used as warm start, with torso joints held fixed)."""
     n = frame_indices.size
-    pos_err_mm = {k: np.empty(n, dtype=np.float64) for k in ARM_KEYS}
-    rot_err_deg = {k: np.empty(n, dtype=np.float64) for k in ARM_KEYS}
+    pos_err_mm = {k: np.empty(n, dtype=np.float64) for k in EEF_KEYS}
+    rot_err_deg = {k: np.empty(n, dtype=np.float64) for k in EEF_KEYS}
     converged = np.zeros(n, dtype=bool)
     iterations = np.zeros(n, dtype=np.int64)
     per_frame_time = np.zeros(n, dtype=np.float64)
@@ -177,30 +178,33 @@ def replay_trajectory(
 
     q_init = data.q_user[frame_indices[0]].copy()
     for i, idx in enumerate(frame_indices):
+        target_torso = data.gt[CHAIN_TORSO][idx]
         target_left = data.gt[CHAIN_ARM_LEFT][idx]
         target_right = data.gt[CHAIN_ARM_RIGHT][idx]
 
         t0 = time.perf_counter()
-        q_sol, ok, info = ik.solve(
-            {CHAIN_ARM_LEFT: target_left, CHAIN_ARM_RIGHT: target_right},
+        q1, ok1, info1 = ik_torso.solve(
+            {CHAIN_TORSO: target_torso},
             q_init=q_init,
-            max_iters=max_iters,
-            tol_pos=tol_pos,
-            tol_rot=tol_rot,
-            damping=damping,
+            max_iters=max_iters, tol_pos=tol_pos, tol_rot=tol_rot, damping=damping,
+        )
+        q_sol, ok2, info2 = ik_arms.solve(
+            {CHAIN_ARM_LEFT: target_left, CHAIN_ARM_RIGHT: target_right},
+            q_init=q1,
+            max_iters=max_iters, tol_pos=tol_pos, tol_rot=tol_rot, damping=damping,
         )
         per_frame_time[i] = time.perf_counter() - t0
 
-        converged[i] = bool(ok)
-        iterations[i] = int(info.get("iterations", 0))
+        converged[i] = bool(ok1 and ok2)
+        iterations[i] = int(info1.get("iterations", 0)) + int(info2.get("iterations", 0))
         q_solutions[i] = q_sol
 
-        pred_left = fk.eef_left(q_sol)
-        pred_right = fk.eef_right(q_sol)
-        pos_err_mm[CHAIN_ARM_LEFT][i] = _position_error_mm(pred_left, target_left)
-        pos_err_mm[CHAIN_ARM_RIGHT][i] = _position_error_mm(pred_right, target_right)
-        rot_err_deg[CHAIN_ARM_LEFT][i] = _quat_angle_deg(pred_left, target_left)
-        rot_err_deg[CHAIN_ARM_RIGHT][i] = _quat_angle_deg(pred_right, target_right)
+        pred = fk.forward(q_sol, links=list(EEF_KEYS))
+        for key, tgt in ((CHAIN_TORSO, target_torso),
+                         (CHAIN_ARM_LEFT, target_left),
+                         (CHAIN_ARM_RIGHT, target_right)):
+            pos_err_mm[key][i] = _position_error_mm(pred[key], tgt)
+            rot_err_deg[key][i] = _quat_angle_deg(pred[key], tgt)
 
         q_init = q_sol
 
@@ -221,14 +225,14 @@ def report_pose_errors(result: IKRunResult) -> None:
     _section("1. End-effector position error (mm)")
     rows = [
         _fmt_stats_row(key, _summary(result.pos_err_mm[key]), result.pos_err_mm[key].size, "mm")
-        for key in ARM_KEYS
+        for key in EEF_KEYS
     ]
     _print_table(STATS_HEADERS, rows)
 
     _section("2. End-effector orientation error (deg)")
     rows = [
         _fmt_stats_row(key, _summary(result.rot_err_deg[key]), result.rot_err_deg[key].size, "deg")
-        for key in ARM_KEYS
+        for key in EEF_KEYS
     ]
     _print_table(STATS_HEADERS, rows)
 
@@ -239,20 +243,20 @@ def report_success_rate(result: IKRunResult, tol_pos_mm: float, tol_rot_deg: flo
     n = result.converged.size
     solver_flag_rate = float(result.converged.mean())
 
-    # Independent tolerance checks per frame.
+    # Independent tolerance checks per frame, across all three end-effectors.
     pos_ok = np.stack(
-        [result.pos_err_mm[k] < tol_pos_mm for k in ARM_KEYS], axis=0
+        [result.pos_err_mm[k] < tol_pos_mm for k in EEF_KEYS], axis=0
     ).all(axis=0)
     rot_ok = np.stack(
-        [result.rot_err_deg[k] < tol_rot_deg for k in ARM_KEYS], axis=0
+        [result.rot_err_deg[k] < tol_rot_deg for k in EEF_KEYS], axis=0
     ).all(axis=0)
     pose_ok = pos_ok & rot_ok
 
     rows = [
-        ["solver `converged=True`", f"{int(result.converged.sum())}/{n}", f"{solver_flag_rate * 100:.2f}%"],
-        [f"pos_err < {tol_pos_mm} mm (both arms)", f"{int(pos_ok.sum())}/{n}", f"{pos_ok.mean() * 100:.2f}%"],
-        [f"rot_err < {tol_rot_deg} deg (both arms)", f"{int(rot_ok.sum())}/{n}", f"{rot_ok.mean() * 100:.2f}%"],
-        ["pose_err ok (pos & rot, both arms)", f"{int(pose_ok.sum())}/{n}", f"{pose_ok.mean() * 100:.2f}%"],
+        ["two-step solver converged (step1 & step2)", f"{int(result.converged.sum())}/{n}", f"{solver_flag_rate * 100:.2f}%"],
+        [f"pos_err < {tol_pos_mm} mm (torso+arms)", f"{int(pos_ok.sum())}/{n}", f"{pos_ok.mean() * 100:.2f}%"],
+        [f"rot_err < {tol_rot_deg} deg (torso+arms)", f"{int(rot_ok.sum())}/{n}", f"{rot_ok.mean() * 100:.2f}%"],
+        ["pose_err ok (all 3 frames)", f"{int(pose_ok.sum())}/{n}", f"{pose_ok.mean() * 100:.2f}%"],
     ]
     _print_table(("criterion", "count", "rate"), rows)
 
@@ -356,7 +360,7 @@ def report_efficiency(result: IKRunResult) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Comprehensive IK validation on an HDF5 trajectory.")
     parser.add_argument("--hdf5", default=DEFAULT_HDF5, help="Path to trajectory HDF5 file.")
-    parser.add_argument("--step", type=int, default=5, help="Replay every Nth frame.")
+    parser.add_argument("--step", type=int, default=1, help="Replay every Nth frame.")
     parser.add_argument("--max-frames", type=int, default=0, help="Limit number of replay frames (0 = no limit).")
     parser.add_argument("--max-iters", type=int, default=100, help="IK max iterations per frame.")
     parser.add_argument("--tol-pos", type=float, default=5e-3, help="Position tolerance (m) passed to the solver.")
@@ -377,20 +381,23 @@ def main() -> None:
         frame_indices = frame_indices[: args.max_frames]
 
     fk = AstribotFK()
-    ik = AstribotIK(fk=fk, chains=[CHAIN_TORSO, CHAIN_ARM_LEFT, CHAIN_ARM_RIGHT])
+    ik_torso = AstribotIK(fk=fk, chains=[CHAIN_TORSO])
+    ik_arms = AstribotIK(fk=fk, chains=[CHAIN_ARM_LEFT, CHAIN_ARM_RIGHT])
 
-    _section("Astribot IK validation report")
+    _section("Astribot IK validation report (two-step: torso -> arms)")
     print(f" HDF5 file          : {args.hdf5}")
     print(f" Total frames       : {data.q_user.shape[0]}")
     print(f" Replay frames      : {frame_indices.size} (step={args.step})")
-    print(f" Active chains      : {ik.active_chains}")
+    print(f" Step1 chains       : {ik_torso.active_chains}")
+    print(f" Step2 chains       : {ik_arms.active_chains}")
     print(f" Solver params      : max_iters={args.max_iters}, tol_pos={args.tol_pos} m, "
           f"tol_rot={args.tol_rot} rad, damping={args.damping}")
     print(f" Pass thresholds    : pos<{args.pass_pos_mm} mm, rot<{args.pass_rot_deg} deg")
 
     result = replay_trajectory(
         fk=fk,
-        ik=ik,
+        ik_torso=ik_torso,
+        ik_arms=ik_arms,
         data=data,
         frame_indices=frame_indices,
         max_iters=args.max_iters,
@@ -401,7 +408,10 @@ def main() -> None:
 
     report_pose_errors(result)
     report_success_rate(result, tol_pos_mm=args.pass_pos_mm, tol_rot_deg=args.pass_rot_deg)
-    report_constraints(fk, ik, result)
+    # Use a 3-chain instance only for the constraint report so that torso
+    # joints (moved in step 1) are counted as active.
+    ik_all = AstribotIK(fk=fk, chains=[CHAIN_TORSO, CHAIN_ARM_LEFT, CHAIN_ARM_RIGHT])
+    report_constraints(fk, ik_all, result)
     report_efficiency(result)
 
     print("\n[Done]")
