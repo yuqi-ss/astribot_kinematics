@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "astribot_kinematics"
+version = "0.1.0"
+description = "Offline forward kinematics for the Astribot S1 humanoid (torso + dual arm), based on pinocchio."
+readme = { text = "Offline FK module for Astribot S1. See package docstrings for usage.", content-type = "text/plain" }
+requires-python = ">=3.8"
+license = { text = "BSD-3-Clause" }
+authors = [{ name = "yuqi" }]
+dependencies = [
+    "numpy>=1.20",
+    "pin>=3.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+sim = ["meshcat>=0.3", "mujoco>=3.0"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["astribot_kinematics*"]
+
+[tool.setuptools.package-data]
+astribot_kinematics = [
+    "assets/*.urdf",
+    "assets/meshes/s1_torso/*.STL",
+    "assets/meshes/s1_head/*.STL",
+    "assets/meshes/s1_arm/*.STL",
+]
